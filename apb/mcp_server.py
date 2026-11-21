@@ -20,7 +20,9 @@ import uuid
 
 from .http import RelayClient, RelayError, read_secret
 
-WAIT_SECONDS = 20
+WAIT_SECONDS = 4
+POLL_INTERVAL = 0.25
+HTTP_TIMEOUT = 2
 SUPPORTED_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 
 
@@ -75,13 +77,24 @@ class Adapter:
 
     def wait(self, request):
         deadline = time.monotonic() + WAIT_SECONDS
-        while request["status"] in ("queued", "claimed") and time.monotonic() < deadline:
-            time.sleep(1)
-            request = self.relay.call("GET", f"/v1/requests/{request['id']}")
-        return {key: request[key] for key in ("id", "status", "result", "is_error")} | (
-            {"note": "still pending; call request_status later"} if request["status"] in ("queued", "claimed") else {}) | (
-            {"note": "the peer took it but did not confirm the outcome; inspect before redoing anything"}
-            if request["status"] == "uncertain" else {})
+        poll_error = None
+        while request["status"] in ("queued", "claimed"):
+            if deadline - time.monotonic() <= POLL_INTERVAL:
+                break
+            time.sleep(POLL_INTERVAL)
+            try:
+                request = self.relay.call("GET", f"/v1/requests/{request['id']}")
+            except RelayError as error:
+                # The original submission succeeded. Keep its ID even if polling fails.
+                poll_error = error.code
+                break
+        result = {key: request[key] for key in ("id", "status", "result", "is_error")}
+        if request["status"] in ("queued", "claimed"):
+            result["note"] = (f"status lookup failed ({poll_error}); call request_status with this ID"
+                              if poll_error else "still pending; call request_status later")
+        elif request["status"] == "uncertain":
+            result["note"] = "the peer took it but did not confirm the outcome; inspect before redoing anything"
+        return result
 
     def call(self, name, args):
         if name == "list_peers":
@@ -94,18 +107,25 @@ class Adapter:
 
 def serve(adapter, stdin=sys.stdin, stdout=sys.stdout):
     def send(message):
-        stdout.write(json.dumps(message, ensure_ascii=False) + "\n")
+        stdout.write(json.dumps(message) + "\n")
         stdout.flush()
 
     for line in stdin:
         try:
+            # Surrogates introduced by surrogateescape indicate malformed wire bytes.
+            line.encode("utf-8")
             message = json.loads(line)
         except ValueError:
             send({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}})
             continue
         if not isinstance(message, dict) or "id" not in message:
             continue  # notifications need no answer
-        request_id, method, params = message["id"], message.get("method"), message.get("params") or {}
+        request_id, method = message["id"], message.get("method")
+        params = message.get("params", {})
+        if not isinstance(params, dict):
+            send({"jsonrpc": "2.0", "id": request_id,
+                  "error": {"code": -32602, "message": "params must be an object"}})
+            continue
         if method == "initialize":
             version = params.get("protocolVersion")
             send({"jsonrpc": "2.0", "id": request_id, "result": {
@@ -118,13 +138,14 @@ def serve(adapter, stdin=sys.stdin, stdout=sys.stdout):
             send({"jsonrpc": "2.0", "id": request_id, "result": {"tools": TOOLS}})
         elif method == "tools/call":
             # Clients add fields such as `_meta`; read what we need and ignore the rest.
-            name, args = params.get("name"), dict(params.get("arguments") or {})
+            name, args = params.get("name"), params.get("arguments", {})
             spec = next((tool["inputSchema"] for tool in TOOLS if tool["name"] == name), None)
-            if spec is None or set(args) - set(spec["properties"]) or not set(spec["required"]) <= set(args):
+            if (spec is None or not isinstance(args, dict) or
+                    set(args) - set(spec["properties"]) or not set(spec["required"]) <= set(args)):
                 send({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32602, "message": "invalid tool or arguments"}})
                 continue
             try:
-                data = adapter.call(name, args)
+                data = adapter.call(name, args.copy())
                 is_error = bool(data.get("is_error")) or data.get("status") in (
                     "failed", "expired", "cancelled", "uncertain")
             except RelayError as error:
@@ -136,7 +157,11 @@ def serve(adapter, stdin=sys.stdin, stdout=sys.stdout):
 
 
 def main():
-    relay = RelayClient(os.environ["APB_RELAY_URL"], read_secret(os.environ["APB_CALLER_TOKEN_FILE"]))
+    # MCP uses UTF-8 on the wire, independently of the Windows pipe code page.
+    sys.stdin.reconfigure(encoding="utf-8", errors="surrogateescape")
+    sys.stdout.reconfigure(encoding="utf-8", newline="\n")
+    relay = RelayClient(os.environ["APB_RELAY_URL"], read_secret(os.environ["APB_CALLER_TOKEN_FILE"]),
+                        timeout=HTTP_TIMEOUT)
     serve(Adapter(relay))
 
 
